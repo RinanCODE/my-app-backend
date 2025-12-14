@@ -1,0 +1,561 @@
+<?php
+
+namespace App\Http\Controllers\Api;
+
+use App\Http\Controllers\Controller;
+use App\Models\Certificate;
+use App\Models\CertificateTemplate;
+use App\Models\Event;
+use App\Models\Participant;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Storage;
+use Illuminate\Support\Str;
+use Dompdf\Dompdf;
+use Dompdf\Options;
+use Endroid\QrCode\QrCode;
+use Endroid\QrCode\Writer\PngWriter;
+use Endroid\QrCode\Encoding\Encoding;
+use Endroid\QrCode\ErrorCorrectionLevel;
+
+class CertificateController extends Controller
+{
+    /**
+     * Generate certificates for all participants of an event.
+     */
+    public function generateForEvent(Request $request, Event $event)
+    {
+        $participants = $event->participants()->whereDoesntHave('certificate')->get();
+
+        if ($participants->isEmpty()) {
+            return response()->json([
+                'message' => 'No participants without certificates found',
+            ], 404);
+        }
+
+        // Get template from event or use default
+        $templateId = $request->input('template_id', $event->template_id);
+        $template = $templateId ? CertificateTemplate::find($templateId) : null;
+
+        $generated = [];
+
+        foreach ($participants as $participant) {
+            $certificate = $this->generateCertificate($event, $participant, $template);
+            $generated[] = $certificate;
+        }
+
+        return response()->json([
+            'message' => 'Certificates generated successfully',
+            'count' => count($generated),
+            'certificates' => $generated,
+        ], 201);
+    }
+
+    /**
+     * Generate a certificate for a specific participant.
+     */
+    public function generateForParticipant(Request $request, Participant $participant)
+    {
+        if ($participant->certificate) {
+            return response()->json([
+                'message' => 'Certificate already exists for this participant',
+                'certificate' => $participant->certificate,
+            ], 400);
+        }
+
+        // Get template from request, event, or use default
+        $templateId = $request->input('template_id', $participant->event->template_id);
+        $template = $templateId ? CertificateTemplate::find($templateId) : null;
+
+        $certificate = $this->generateCertificate($participant->event, $participant, $template);
+
+        return response()->json([
+            'message' => 'Certificate generated successfully',
+            'certificate' => $certificate,
+        ], 201);
+    }
+
+    /**
+     * Download a certificate PDF.
+     */
+    public function download(Certificate $certificate)
+    {
+        if (!$certificate->pdf_path || !Storage::exists($certificate->pdf_path)) {
+            return response()->json([
+                'message' => 'Certificate PDF not found',
+            ], 404);
+        }
+
+        return Storage::download($certificate->pdf_path, "certificate-{$certificate->certificate_id}.pdf");
+    }
+
+    /**
+     * Generate certificate PDF and QR code.
+     */
+    private function generateCertificate(Event $event, Participant $participant, ?CertificateTemplate $template = null): Certificate
+    {
+        // Generate unique certificate ID
+        $certificateId = 'CERT-' . strtoupper(Str::random(12));
+
+        // Create verification URL to the frontend UI (fallback to localhost:4200)
+        $frontendBase = env('FRONTEND_URL', 'http://localhost:4200');
+        $verificationUrl = rtrim($frontendBase, '/') . "/verify?code={$certificateId}";
+
+        // Generate QR code
+        $qrCode = new QrCode($verificationUrl);
+        $qrCode->setSize(200);
+        $qrCode->setMargin(10);
+        $qrCode->setEncoding(new Encoding('UTF-8'));
+        $qrCode->setErrorCorrectionLevel(ErrorCorrectionLevel::Medium);
+
+        $writer = new PngWriter();
+        $qrCodeResult = $writer->write($qrCode);
+        $qrCodeData = $qrCodeResult->getString();
+
+        // Save QR code
+        $qrCodePath = 'certificates/qr-codes/' . $certificateId . '.png';
+        Storage::put($qrCodePath, $qrCodeData);
+
+        // Generate PDF using template
+        $pdf = $this->generatePdf($event, $participant, $certificateId, $qrCodeData, $template);
+
+        // Save PDF
+        $pdfPath = 'certificates/pdfs/' . $certificateId . '.pdf';
+        Storage::put($pdfPath, $pdf);
+
+        // Create certificate record
+        $certificate = Certificate::create([
+            'event_id' => $event->id,
+            'participant_id' => $participant->id,
+            'template_id' => $template?->id,
+            'certificate_id' => $certificateId,
+            'qr_code_path' => $qrCodePath,
+            'pdf_path' => $pdfPath,
+            'issued_date' => now(),
+            'is_valid' => true,
+        ]);
+
+        return $certificate;
+    }
+
+    /**
+     * Generate PDF content using template.
+     */
+    private function generatePdf(Event $event, Participant $participant, string $certificateId, string $qrCodeData, ?CertificateTemplate $template = null): string
+    {
+        $options = new Options();
+        $options->set('isHtml5ParserEnabled', true);
+        $options->set('isRemoteEnabled', true);
+        // Normalize sizing to screen-like DPI to reduce unexpected scaling
+        $options->set('dpi', 96);
+
+        $dompdf = new Dompdf($options);
+
+        $qrCodeBase64 = base64_encode($qrCodeData);
+
+        // Use template if provided (even if it has no custom HTML), otherwise use default
+        if ($template) {
+            $html = $this->processTemplate($template, $event, $participant, $certificateId, $qrCodeBase64);
+        } else {
+            $html = $this->getDefaultTemplate($event, $participant, $certificateId, $qrCodeBase64);
+        }
+
+        // Post-process: center content and move QR/ID to page 2
+        $extraCss = '<style>
+            /* Make page 1 content centered and within safe insets even for custom templates */
+            html, body { margin:0; padding:0; background:transparent; }
+            .page1 { position: relative; }
+            .page1 > *:first-child { position:absolute; top:16mm; right:16mm; bottom:16mm; left:16mm; box-sizing:border-box; overflow:hidden; display:flex; flex-direction:column; align-items:center; justify-content:center; text-align:center; }
+            /* If a template already uses certificate-container, enforce centering and inset too */
+            .page1 .certificate-container{ position:absolute; top:16mm; right:16mm; bottom:16mm; left:16mm; margin:0 !important; width:auto; height:auto; box-sizing:border-box; overflow:hidden; display:flex; flex-direction:column; justify-content:center; align-items:center; text-align:center; }
+            /* Hide items meant for page 2 on page 1 */
+            .page1 .qr-code, .page1 .certificate-id{ display:none !important; }
+            /* Page 2 layout for QR + ID */
+            .page2{ page-break-before:always; width:100%; height:100%; display:flex; align-items:center; justify-content:center; }
+            .page2-inner{ width:70%; text-align:center; }
+            .qr-img{ width:40mm; height:40mm; display:inline-block; border:0.3mm solid #ddd; padding:1mm; background:#fff; }
+            .cert-id{ margin-top:6mm; font-size:14px; color:#333; }
+        </style>';
+        if (strpos($html, '</head>') !== false) {
+            $html = str_replace('</head>', $extraCss.'</head>', $html);
+        } else {
+            $html = $extraCss . $html;
+        }
+        $qrPage = '<div class="page2"><div class="page2-inner"><img class="qr-img" src="data:image/png;base64,' . $qrCodeBase64 . '" alt="QR Code"><div class="cert-id">Certificate ID: ' . htmlspecialchars($certificateId) . '</div></div></div>';
+        if (strpos($html, '<body') !== false) {
+            $html = preg_replace('/<body(.*?)>/', '<body$1><div class="page1">', $html, 1);
+            $html = str_replace('</body>', '</div>' . $qrPage . '</body>', $html);
+        } else {
+            $html = '<div class="page1">' . $html . '</div>' . $qrPage;
+        }
+
+        $dompdf->loadHtml($html);
+        $dompdf->setPaper('A4', 'landscape');
+        $dompdf->render();
+
+        return $dompdf->output();
+    }
+
+    /**
+     * Process template with placeholders and customization.
+     */
+    private function processTemplate(CertificateTemplate $template, Event $event, Participant $participant, string $certificateId, string $qrCodeBase64): string
+    {
+        $settings = $template->customization_settings ?? [];
+        $html = $template->html_template;
+        $css = $template->css_styles ?? '';
+
+        // Get customization settings
+        $titleText = $settings['title_text'] ?? 'Certificate of Participation';
+        $subtitleText = $settings['subtitle_text'] ?? 'This is to certify that';
+        $bodyText = $settings['body_text'] ?? 'has successfully participated in';
+        $titleFont = $settings['title_font'] ?? 'Times New Roman';
+        $subtitleFont = $settings['subtitle_font'] ?? 'Times New Roman';
+        $nameFont = $settings['name_font'] ?? 'Times New Roman';
+        $bodyFont = $settings['body_font'] ?? 'Times New Roman';
+        $eventFont = $settings['event_font'] ?? 'Arial';
+        $dateFont = $settings['date_font'] ?? 'Arial';
+        $titleFontSize = $settings['title_font_size'] ?? '48px';
+        $subtitleFontSize = $settings['subtitle_font_size'] ?? '24px';
+        $nameFontSize = $settings['name_font_size'] ?? '36px';
+        $bodyFontSize = $settings['body_font_size'] ?? '18px';
+        $titleColor = $settings['title_color'] ?? '#2c3e50';
+        $subtitleColor = $settings['subtitle_color'] ?? '#7f8c8d';
+        $nameColor = $settings['name_color'] ?? '#2c3e50';
+        $bodyColor = $settings['body_color'] ?? '#34495e';
+        $eventFontSize = $settings['event_font_size'] ?? '20px';
+        $eventColor = $settings['event_color'] ?? '#444';
+        $dateFontSize = $settings['date_font_size'] ?? '16px';
+        $dateColor = $settings['date_color'] ?? '#333';
+
+        // Replace placeholders
+        $replacements = [
+            '{{TITLE}}' => '<span class="certificate-title">' . htmlspecialchars($titleText) . '</span>',
+            '{{SUBTITLE}}' => '<span class="certificate-subtitle">' . htmlspecialchars($subtitleText) . '</span>',
+            '{{PARTICIPANT_NAME}}' => '<span class="participant-name">' . htmlspecialchars($participant->name) . '</span>',
+            '{{EVENT_NAME}}' => '<span class="event-name">' . htmlspecialchars($event->name) . '</span>',
+            '{{EVENT_LOCATION}}' => $event->location ? htmlspecialchars($event->location) : '',
+            // Emit plain text for date to avoid nested span duplication in base HTML
+            '{{EVENT_DATE}}' => $event->event_date ? $event->event_date->format('F d, Y') : '',
+            '{{ISSUED_DATE}}' => '<span class="issued-date">' . now()->format('F d, Y') . '</span>',
+            '{{CERTIFICATE_ID}}' => htmlspecialchars($certificateId),
+            '{{BODY_TEXT}}' => htmlspecialchars($bodyText),
+            '{{QR_CODE}}' => '',
+        ];
+
+        // If no custom HTML is provided, build a base HTML that supports placeholders and styling
+        if (!$html || trim($html) === '') {
+            $html = '
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="UTF-8">
+            <style>
+                /* Zero margins; control insets explicitly to avoid clipping/overflow */
+                @page { size: A4 landscape; margin: 0; }
+                html, body { height: 100%; width: 100%; overflow: hidden; }
+                * { box-sizing: border-box; }
+                body {
+                    font-family: "Times New Roman", serif;
+                    margin: 0;
+                    padding: 0;
+                    background: transparent;
+                    position: relative;
+                }
+                .certificate-container {
+                    position: absolute;
+                    top: 18mm; right: 18mm; bottom: 18mm; left: 18mm; /* safe inset */
+                    background: white;
+                    box-sizing: border-box;
+                    text-align: center;
+                    overflow: hidden; /* keep background art inside frame */
+                    border: 0 !important;
+                    box-shadow: inset 0 0 0 3mm #d4af37; /* frame without affecting box size */
+                    page-break-inside: avoid; page-break-after: avoid; page-break-before: avoid;
+                }
+                .certificate-container .inner {
+                    position: absolute;
+                    top: 0; right: 0; bottom: 0; left: 0; /* no inner whitespace to avoid asymmetry */
+                    box-sizing: border-box;
+                }
+                .certificate-title {
+                    font-size: 48px;
+                    font-weight: bold;
+                    color: #2c3e50;
+                    margin-bottom: 5mm;
+                    text-transform: uppercase;
+                    letter-spacing: 3px;
+                }
+                .certificate-subtitle {
+                    font-size: 24px;
+                    color: #7f8c8d;
+                    margin-bottom: 6mm;
+                }
+                .participant-name {
+                    font-size: 36px;
+                    font-weight: bold;
+                    color: #2c3e50;
+                    margin: 8mm 0;
+                    padding: 4mm 0;
+                    border-bottom: 1mm solid #d4af37;
+                    display: inline-block;
+                }
+                .event-details {
+                    font-size: 18px;
+                    color: #34495e;
+                    margin: 5mm 0;
+                    line-height: 1.6;
+                }
+                .certificate-id { font-size: 14px; color: #95a5a6; margin-top: 8mm; }
+                .qr-code { display: none !important; }
+                .issued-date { font-size: 16px; color: #7f8c8d; margin-top: 6mm; }
+            </style>
+        </head>
+        <body>
+            <div class="certificate-container">
+                <div class="inner">
+                    <div class="certificate-title">{{TITLE}}</div>
+                    <div class="certificate-subtitle">{{SUBTITLE}}</div>
+                    <div class="participant-name">{{PARTICIPANT_NAME}}</div>
+                    <div class="event-details">
+                        {{BODY_TEXT}}<br>
+                        <strong>{{EVENT_NAME}}</strong><br>
+                        {{#EVENT_LOCATION}}held at {{EVENT_LOCATION}}<br>{{/EVENT_LOCATION}}
+                        {{#EVENT_DATE}}on <span class="event-date">{{EVENT_DATE}}</span><br>{{/EVENT_DATE}}
+                    </div>
+                    <div class="issued-date">Issued on {{ISSUED_DATE}}</div>
+                    <div class="certificate-id">Certificate ID: {{CERTIFICATE_ID}}</div>
+                </div>
+                {{QR_CODE}}
+            </div>
+        </body>
+        </html>';
+        }
+
+        // Replace placeholders in HTML
+        foreach ($replacements as $placeholder => $value) {
+            $html = str_replace($placeholder, $value, $html);
+        }
+
+        // Handle conditional placeholders ({{#EVENT_LOCATION}}...{{/EVENT_LOCATION}})
+        if ($event->location) {
+            $html = preg_replace('/\{\{#EVENT_LOCATION\}\}(.*?)\{\{\/EVENT_LOCATION\}\}/s', '$1', $html);
+        } else {
+            $html = preg_replace('/\{\{#EVENT_LOCATION\}\}.*?\{\{\/EVENT_LOCATION\}\}/s', '', $html);
+        }
+
+        if ($event->event_date) {
+            $html = preg_replace('/\{\{#EVENT_DATE\}\}(.*?)\{\{\/EVENT_DATE\}\}/s', '$1', $html);
+        } else {
+            $html = preg_replace('/\{\{#EVENT_DATE\}\}.*?\{\{\/EVENT_DATE\}\}/s', '', $html);
+        }
+
+        // Add background image if exists (convert to base64 for PDF)
+        $backgroundStyle = '';
+        if ($template->background_image_path && Storage::disk('public')->exists($template->background_image_path)) {
+            $backgroundImageData = Storage::disk('public')->get($template->background_image_path);
+            $backgroundBase64 = base64_encode($backgroundImageData);
+            // Determine MIME type from file extension
+            $extension = pathinfo($template->background_image_path, PATHINFO_EXTENSION);
+            $mimeTypes = [
+                'jpg' => 'image/jpeg',
+                'jpeg' => 'image/jpeg',
+                'png' => 'image/png',
+                'gif' => 'image/gif',
+            ];
+            $backgroundMime = $mimeTypes[strtolower($extension)] ?? 'image/jpeg';
+            $backgroundStyle = "background-image: url('data:{$backgroundMime};base64,{$backgroundBase64}'); background-size: 100% 100%; background-position: center center; background-repeat: no-repeat; background-origin: border-box; background-clip: border-box;";
+        }
+
+        // Build CSS with customization
+        $containerBorderOverride = $backgroundStyle ? 'border: 0 !important;' : 'border: 3mm solid #d4af37;';
+        $bgPseudo = '';
+        if ($backgroundStyle) {
+            // Draw background inside the 3mm frame using ::before with the provided background style
+            $bgPseudo = ".certificate-container::before { content: ''; position: absolute; top: 3mm; right: 3mm; bottom: 3mm; left: 3mm; {$backgroundStyle} background-repeat: no-repeat; background-position: center center; background-size: 100% 100%; z-index: 0; }";
+        }
+        $customCss = "
+            html, body { height: 100%; }
+            .certificate-title {
+                font-family: '{$titleFont}', serif;
+                font-size: {$titleFontSize} !important;
+                color: {$titleColor} !important;
+            }
+            .certificate-subtitle {
+                font-family: '{$subtitleFont}', serif;
+                font-size: {$subtitleFontSize} !important;
+                color: {$subtitleColor} !important;
+            }
+            .participant-name {
+                font-family: '{$nameFont}', serif;
+                font-size: {$nameFontSize} !important;
+                color: {$nameColor} !important;
+            }
+            .event-details {
+                font-family: '{$bodyFont}', serif;
+                font-size: {$bodyFontSize} !important;
+                color: {$bodyColor} !important;
+            }
+            .event-name {
+                font-family: '{$eventFont}', sans-serif;
+                font-size: {$eventFontSize} !important;
+                color: {$eventColor} !important;
+                letter-spacing: 1px;
+            }
+            .certificate-container {
+                width: 100%;
+                height: 100%;
+                box-sizing: border-box;
+                position: relative; /* establish containing block for absolutely positioned children like QR */
+                page-break-inside: avoid;
+                {$containerBorderOverride}
+            }
+            .certificate-container > * { position: relative; z-index: 1; }
+            {$bgPseudo}
+            .qr-code {
+                position: absolute;
+                bottom: 8mm;
+                right: 8mm;
+                width: 26mm;
+                height: 26mm;
+                z-index: 2;
+                background: #fff;
+                border: 0.3mm solid #ddd;
+                padding: 1mm;
+            }
+            .issued-date {
+                font-family: '{$dateFont}', sans-serif;
+                font-size: {$dateFontSize} !important;
+                color: {$dateColor} !important;
+            }
+        ";
+
+        // Combine CSS
+        $fullCss = $css . "\n" . $customCss;
+
+        // Determine if container exists
+        $hasContainer = strpos($html, 'certificate-container') !== false;
+
+        // Wrap HTML with styles if not already wrapped
+        if (strpos($html, '<style>') === false) {
+            // Create a full document and ensure a certificate-container wrapper
+            $bodyContent = $hasContainer ? $html : '<div class="certificate-container">' . $html . '</div>';
+            $html = '<!DOCTYPE html><html><head><meta charset="UTF-8"><style>' . $fullCss . '</style></head><body>' . $bodyContent . '</body></html>';
+        } else {
+            // Insert custom CSS before closing </style>
+            $html = str_replace('</style>', $customCss . '</style>', $html);
+            // If the template provides full HTML but lacks container, inject a wrapper around body contents
+            if (!$hasContainer) {
+                if (strpos($html, '<body') !== false) {
+                    // Insert opening wrapper right after <body...>
+                    $html = preg_replace('/<body(.*?)>/', '<body$1><div class="certificate-container">', $html, 1);
+                    // Insert closing wrapper before </body>
+                    $html = str_replace('</body>', '</div></body>', $html);
+                } else {
+                    // No explicit body tag; prepend/append wrapper
+                    $html = '<div class="certificate-container">' . $html . '</div>';
+                }
+            }
+        }
+
+        return $html;
+    }
+
+    /**
+     * Get default template HTML.
+     */
+    private function getDefaultTemplate(Event $event, Participant $participant, string $certificateId, string $qrCodeBase64): string
+    {
+        return '
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="UTF-8">
+            <style>
+                /* Zero margins; control insets explicitly to avoid clipping/overflow */
+                @page { margin: 0; size: A4 landscape; }
+                html, body { height: 100%; width: 100%; }
+                * { box-sizing: border-box; }
+                /* Keep body clean for print; spacing handled inside container */
+                body {
+                    font-family: "Times New Roman", serif;
+                    margin: 0;
+                    padding: 0;
+                    background: transparent;
+                    position: relative;
+                }
+                .certificate-container {
+                    position: absolute;
+                    top: 16mm; right: 16mm; bottom: 16mm; left: 16mm; /* safe inset */
+                    background: white;
+                    text-align: center;
+                    box-sizing: border-box;
+                    overflow: hidden; /* keep background art inside frame */
+                    page-break-inside: avoid;
+                    border: 0 !important;
+                    box-shadow: inset 0 0 0 3mm #d4af37; /* frame without affecting box size */
+                }
+                .certificate-container .inner {
+                    position: absolute;
+                    top: 0; right: 0; bottom: 0; left: 0; /* remove inner whitespace */
+                }
+                .certificate-title {
+                    font-size: 48px;
+                    font-weight: bold;
+                    color: #2c3e50;
+                    margin-bottom: 20px;
+                    text-transform: uppercase;
+                    letter-spacing: 3px;
+                }
+                .certificate-subtitle {
+                    font-size: 24px;
+                    color: #7f8c8d;
+                    margin-bottom: 10mm;
+                }
+                .participant-name {
+                    font-size: 36px;
+                    font-weight: bold;
+                    color: #2c3e50;
+                    margin: 10mm 0;
+                    padding: 5mm 0;
+                    border-bottom: 1mm solid #d4af37;
+                    display: inline-block;
+                }
+                .event-details {
+                    font-size: 18px;
+                    color: #34495e;
+                    margin: 6mm 0;
+                    line-height: 1.8;
+                }
+                .certificate-id { font-size: 14px; color: #95a5a6; margin-top: 8mm; }
+                .qr-code { display: none !important; }
+                .issued-date { font-size: 16px; color: #7f8c8d; margin-top: 6mm; }
+            </style>
+        </head>
+        <body>
+            <div class="certificate-container">
+                <div class="inner">
+                    <div class="certificate-title">Certificate of Participation</div>
+                    <div class="certificate-subtitle">This is to certify that</div>
+                    <div class="participant-name">' . htmlspecialchars($participant->name) . '</div>
+                    <div class="event-details">
+                        has successfully participated in<br>
+                        <strong>' . htmlspecialchars($event->name) . '</strong><br>' .
+                        ($event->location ? 'held at ' . htmlspecialchars($event->location) . '<br>' : '') .
+                        ($event->event_date ? 'on ' . $event->event_date->format('F d, Y') . '<br>' : '') . '
+                    </div>
+                    <div class="issued-date">
+                        Issued on ' . now()->format('F d, Y') . '
+                    </div>
+                    <div class="certificate-id">
+                        Certificate ID: ' . htmlspecialchars($certificateId) . '
+                    </div>
+                </div>
+                <!-- QR removed -->
+            </div>
+        </body>
+        </html>';
+    }
+}
+
+
+
