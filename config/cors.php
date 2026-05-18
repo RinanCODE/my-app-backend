@@ -5,7 +5,7 @@ return [
 
     'allowed_methods' => ['*'],
 
-    'allowed_origins' => ['http://localhost:8080', 'http://localhost:4200'],
+    'allowed_origins' => ['my-app-frontend-production-4e07.up.railway.app'],
 
     'allowed_origins_patterns' => [],
 
