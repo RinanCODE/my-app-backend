@@ -5,7 +5,7 @@ return [
 
     'allowed_methods' => ['*'],
 
-    'allowed_origins' => ['my-app-frontend-production-4e07.up.railway.app'],
+    'allowed_origins' => ['https://my-app-frontend-production-4e07.up.railway.app'],
 
     'allowed_origins_patterns' => [],
 
